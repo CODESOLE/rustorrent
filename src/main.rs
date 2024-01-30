@@ -1,5 +1,6 @@
-use anyhow::Ok;
+use anyhow::{anyhow, Context, Ok};
 use hex::{FromHex, ToHex};
+use rand;
 use serde_json::{self, Map};
 use sha1::{Digest, Sha1};
 use std::{
@@ -130,6 +131,65 @@ fn decode_binary(encoded_value: &[u8]) -> (serde_json::Value, &[u8]) {
     )
 }
 
+fn peer_initial_tcp_conn(
+    peer_addr: &str,
+    infohash_20_bytes: &[u8],
+    peeridstr: &str,
+) -> anyhow::Result<std::net::TcpStream> {
+    let handsake_payload = [19]
+        .iter()
+        .chain(b"BitTorrent protocol")
+        .chain([0u8; 8].iter())
+        .chain(infohash_20_bytes.iter())
+        .chain(peeridstr.as_bytes())
+        .cloned()
+        .collect::<Vec<u8>>();
+    let mut tcpstream = std::net::TcpStream::connect(&peer_addr).context("tcp connection")?;
+    tcpstream
+        .write_all(&handsake_payload)
+        .context("tcpstream write handshake")?;
+    let mut recv_handshake = [0u8; 68];
+    tcpstream
+        .read(&mut recv_handshake)
+        .context("tcpstream read handshake")?;
+    let peer_id = recv_handshake
+        .iter()
+        .rev()
+        .take(20)
+        .cloned()
+        .collect::<Vec<u8>>();
+    println!("Peer ID: {}", hex::encode(&peer_id));
+    let mut peer_payload = [0u8; 13];
+
+    // recv bitfield(5)
+    tcpstream
+        .read(&mut peer_payload)
+        .context("tcpstream read peer_payload")?;
+
+    let peer_payload_length = u32::from_be_bytes([
+        peer_payload[0],
+        peer_payload[1],
+        peer_payload[2],
+        peer_payload[3],
+    ]);
+    let msg_id = peer_payload[4];
+    let payload = &peer_payload[5..];
+    println!("Peer Payload Length: {}", peer_payload_length);
+    println!("Peer Payload Type: {}", msg_id);
+    println!("Peer Payload: {:x?}", payload);
+
+    // send intrested(2)
+    tcpstream.write(&[0, 0, 0, 1, 2])?;
+
+    // recv unchoke(1)
+    tcpstream.read(&mut peer_payload)?;
+    if peer_payload[4] == 1 {
+        Ok(tcpstream)
+    } else {
+        Err(anyhow!("Peer did not send unchoke message!"))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -180,10 +240,10 @@ fn main() -> anyhow::Result<()> {
     println!("INFO_HASH: {infohash}");
     let piece_length = &decoded_val["info"]["piece length"];
     println!("PIECE_LENGTH: {piece_length}");
-    println!("PIECE_HASHES:");
-    for x in &pieces_hash {
-        println!("{x}");
-    }
+    // println!("PIECE_HASHES:");
+    // for x in &pieces_hash {
+    //     println!("{x}");
+    // }
 
     let len_str = length.to_string();
     let a = hex::decode(&infohash).unwrap();
@@ -193,7 +253,29 @@ fn main() -> anyhow::Result<()> {
         urlencoded.push_str(&hex::encode(&[*b]));
     }
 
-    let url = format!("{}?peer_id=00112233445566778899&port=6969&uploaded=0&downloaded=0&left={}&compact=1&info_hash={}", announce.as_str().unwrap(), len_str, urlencoded.as_str());
+    let mut peeridstr = String::new();
+    for _ in 0..20 {
+        peeridstr.push_str((rand::random::<u8>() % 10).to_string().as_str());
+    }
+    let port = announce
+        .as_str()
+        .unwrap()
+        .split_once(':')
+        .and_then(|(_, s2)| {
+            s2.split_once(':')
+                .and_then(|(_, x2)| x2.split_once('/').and_then(|(y1, _)| Some(y1)))
+        })
+        .unwrap_or("6881");
+
+    let url = format!(
+        "{}?peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1&info_hash={}",
+        announce.as_str().unwrap(),
+        &peeridstr,
+        port,
+        len_str,
+        urlencoded.as_str()
+    );
+    println!("REQUEST_URL: {}", &url);
 
     let client = reqwest::blocking::Client::new();
     let response = client.get(url).send()?;
@@ -223,118 +305,85 @@ fn main() -> anyhow::Result<()> {
         println!("{}:{}", ipv4ip, ipv4port);
     }
 
-    let handsake_payload = [19]
-        .iter()
-        .chain(b"BitTorrent protocol")
-        .chain([0; 8].iter())
-        .chain(infohash_20_bytes.iter())
-        .chain(b"00112233445566778899")
-        .cloned()
-        .collect::<Vec<u8>>();
-    let mut tcpstream = std::net::TcpStream::connect(&peers_vec[2])?;
-    tcpstream.write_all(&handsake_payload)?;
-    let mut recv_handshake = [0u8; 68];
-    tcpstream.read(&mut recv_handshake)?;
-    let peer_id = recv_handshake
-        .iter()
-        .rev()
-        .take(20)
-        .cloned()
-        .collect::<Vec<u8>>();
-    println!("Peer ID: {}", hex::encode(&peer_id));
-    let mut peer_payload = [0; 13];
-
-    // recv bitfield(5)
-    tcpstream.read(&mut peer_payload)?;
-
-    let peer_payload_length = u32::from_be_bytes([
-        peer_payload[0],
-        peer_payload[1],
-        peer_payload[2],
-        peer_payload[3],
-    ]);
-    let msg_id = peer_payload[4];
-    let payload = &peer_payload[5..];
-    println!("Peer Payload Length: {}", peer_payload_length);
-    println!("Peer Payload Type: {}", msg_id);
-    println!("Peer Payload: {:x?}", payload);
-
-    // send intrested(2)
-    tcpstream.write(&[0, 0, 0, 1, 2])?;
-
-    // recv unchoke(1)
-    tcpstream.read(&mut peer_payload)?;
-
-    // send request(6) each block
-    if peer_payload[4] == 1 {
-        let mut dest_file = std::fs::File::options()
-            .append(true)
-            .create(true)
-            .open(&destination)?;
-
-        let mut single_piece = Vec::<u8>::new();
-        for p_idx in 0..pieces_hash.len() {
-            let p_len = if p_idx == pieces_hash.len() - 1 {
-                let x = piece_length.as_u64().unwrap() as usize * (pieces_hash.len() - 1);
-                length.to_string().parse::<usize>().unwrap() - x
-            } else {
-                piece_length.as_u64().unwrap() as usize
-            };
-            single_piece.reserve_exact(p_len as usize);
-            let mut remainder_of_block: Option<u32> = None;
-            let block_count = if p_len % (16 * 1024) == 0 {
-                p_len as u32 / (16 * 1024) as u32
-            } else {
-                remainder_of_block = Some(p_len as u32 % (16 * 1024) as u32);
-                (p_len as u32 / (16 * 1024) + 1) as u32
-            };
-            let mut begin = 0u32;
-            let mut block_idx = 0u32;
-
-            while begin < p_len as u32 {
-                let rem = if block_idx == (block_count - 1) && remainder_of_block.is_some() {
-                    remainder_of_block.clone().unwrap()
-                } else {
-                    16 * 1024 as u32
-                };
-                let p = 13u32
-                    .to_be_bytes()
-                    .iter()
-                    .chain([6].iter())
-                    .chain(&(p_idx as u32).to_be_bytes())
-                    .chain(&begin.to_be_bytes())
-                    .chain(&rem.to_be_bytes())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                tcpstream.write_all(&p)?;
-                tcpstream.read_exact(&mut peer_payload)?;
-                assert_eq!(
-                    peer_payload[4], 7,
-                    "Message id should be 7 which is piece message!"
-                );
-                let mut block = vec![0u8; rem as usize];
-                tcpstream.read_exact(&mut block)?;
-                single_piece.extend_from_slice(&block);
-                begin += block.len() as u32;
-                block_idx += 1;
-            }
-            println!("Downloaded piece_{} size: {}", p_idx, single_piece.len());
-            let mut hasher_single_piece = Sha1::new();
-            hasher_single_piece.update(&single_piece);
-            let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
-            let single_piece_hash_str = hex::encode(&single_piece_hash_bytes);
-            println!(
-                "{} <=> {}",
-                pieces_hash[p_idx as usize], &single_piece_hash_str
-            );
-            if pieces_hash[p_idx as usize] != single_piece_hash_str {
-                panic!("Piece {p_idx}'s hash is not same!");
-            }
-            dest_file.write_all(&single_piece)?;
-            single_piece.clear();
+    let mut tcpstream: Option<std::net::TcpStream> = None;
+    for p in peers_vec.iter() {
+        if let Some(t) = peer_initial_tcp_conn(p, &infohash_20_bytes, &peeridstr).ok() {
+            tcpstream = Some(t);
+            break;
         }
-    } else {
-        panic!("Peer did not send unchoke(1) message");
+    }
+    if tcpstream.is_none() {
+        panic!("No peers send unchoke message!");
+    }
+    let mut tcpstream = tcpstream.unwrap();
+
+    // send request(6) to each block
+    let mut dest_file = std::fs::File::options()
+        .append(true)
+        .create(true)
+        .open(&destination)?;
+
+    let mut single_piece = Vec::<u8>::new();
+    let mut peer_payload = [0u8; 13];
+    for p_idx in 0..pieces_hash.len() {
+        let p_len = if p_idx == pieces_hash.len() - 1 {
+            let x = piece_length.as_u64().unwrap() as usize * (pieces_hash.len() - 1);
+            length.to_string().parse::<usize>().unwrap() - x
+        } else {
+            piece_length.as_u64().unwrap() as usize
+        };
+        single_piece.reserve_exact(p_len as usize);
+        let mut remainder_of_block: Option<u32> = None;
+        let block_count = if p_len % (16 * 1024) == 0 {
+            p_len as u32 / (16 * 1024) as u32
+        } else {
+            remainder_of_block = Some(p_len as u32 % (16 * 1024) as u32);
+            (p_len as u32 / (16 * 1024) + 1) as u32
+        };
+        let mut begin = 0u32;
+        let mut block_idx = 0u32;
+
+        while begin < p_len as u32 {
+            let rem = if block_idx == (block_count - 1) && remainder_of_block.is_some() {
+                remainder_of_block.clone().unwrap()
+            } else {
+                16 * 1024 as u32
+            };
+            let p = 13u32
+                .to_be_bytes()
+                .iter()
+                .chain([6].iter())
+                .chain(&(p_idx as u32).to_be_bytes())
+                .chain(&begin.to_be_bytes())
+                .chain(&rem.to_be_bytes())
+                .cloned()
+                .collect::<Vec<_>>();
+            tcpstream.write_all(&p)?;
+            tcpstream.read_exact(&mut peer_payload)?;
+            assert_eq!(
+                peer_payload[4], 7,
+                "Message id should be 7 which is piece message!"
+            );
+            let mut block = vec![0u8; rem as usize];
+            tcpstream.read_exact(&mut block)?;
+            single_piece.extend_from_slice(&block);
+            begin += block.len() as u32;
+            block_idx += 1;
+        }
+        println!("Downloaded piece_{} size: {}", p_idx, single_piece.len());
+        let mut hasher_single_piece = Sha1::new();
+        hasher_single_piece.update(&single_piece);
+        let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
+        let single_piece_hash_str = hex::encode(&single_piece_hash_bytes);
+        println!(
+            "{} <=> {}",
+            pieces_hash[p_idx as usize], &single_piece_hash_str
+        );
+        if pieces_hash[p_idx as usize] != single_piece_hash_str {
+            panic!("Piece {p_idx}'s hash is not same!");
+        }
+        dest_file.write_all(&single_piece)?;
+        single_piece.clear();
     }
 
     Ok(())
