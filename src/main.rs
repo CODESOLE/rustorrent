@@ -193,7 +193,7 @@ fn main() -> anyhow::Result<()> {
         urlencoded.push_str(&hex::encode(&[*b]));
     }
 
-    let url = format!("{}?peer_id=00112233445566778899&port=6881&uploaded=0&downloaded=0&left={}&compact=1&info_hash={}", announce.as_str().unwrap(), len_str, urlencoded.as_str());
+    let url = format!("{}?peer_id=00112233445566778899&port=6969&uploaded=0&downloaded=0&left={}&compact=1&info_hash={}", announce.as_str().unwrap(), len_str, urlencoded.as_str());
 
     let client = reqwest::blocking::Client::new();
     let response = client.get(url).send()?;
@@ -318,7 +318,7 @@ fn main() -> anyhow::Result<()> {
                 begin += block.len() as u32;
                 block_idx += 1;
             }
-            println!("Downloaded single piece size: {}", single_piece.len());
+            println!("Downloaded piece_{} size: {}", p_idx, single_piece.len());
             let mut hasher_single_piece = Sha1::new();
             hasher_single_piece.update(&single_piece);
             let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
