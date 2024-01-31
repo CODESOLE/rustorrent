@@ -144,7 +144,8 @@ fn peer_initial_tcp_conn(
         .chain(peeridstr.as_bytes())
         .cloned()
         .collect::<Vec<u8>>();
-    let mut tcpstream = std::net::TcpStream::connect(&peer_addr).context("tcp connection")?;
+    println!(">>> {}", peer_addr);
+    let mut tcpstream = std::net::TcpStream::connect(peer_addr).context("tcp connection")?;
     tcpstream
         .write_all(&handsake_payload)
         .context("tcpstream write handshake")?;
@@ -159,31 +160,36 @@ fn peer_initial_tcp_conn(
         .cloned()
         .collect::<Vec<u8>>();
     println!("Peer ID: {}", hex::encode(&peer_id));
-    let mut peer_payload = [0u8; 13];
+    let mut payload_header = [0u8; 5];
 
     // recv bitfield(5)
     tcpstream
-        .read(&mut peer_payload)
-        .context("tcpstream read peer_payload")?;
+        .read_exact(&mut payload_header)
+        .context("tcpstream read payload_header")?;
 
     let peer_payload_length = u32::from_be_bytes([
-        peer_payload[0],
-        peer_payload[1],
-        peer_payload[2],
-        peer_payload[3],
+        payload_header[0],
+        payload_header[1],
+        payload_header[2],
+        payload_header[3],
     ]);
-    let msg_id = peer_payload[4];
-    let payload = &peer_payload[5..];
+    let mut payload = vec![0u8; peer_payload_length as usize - 1];
+    tcpstream
+        .read_exact(&mut payload)
+        .context("tcpstream read payload")?;
+    let msg_id = payload_header[4];
+
     println!("Peer Payload Length: {}", peer_payload_length);
     println!("Peer Payload Type: {}", msg_id);
-    println!("Peer Payload: {:x?}", payload);
+    println!("Peer Payload: {:x?}", &payload);
 
     // send intrested(2)
     tcpstream.write(&[0, 0, 0, 1, 2])?;
 
     // recv unchoke(1)
-    tcpstream.read(&mut peer_payload)?;
-    if peer_payload[4] == 1 {
+    tcpstream.read_exact(&mut payload_header)?;
+    println!("payload_header: {:x?}", payload_header);
+    if payload_header[4] == 1 {
         Ok(tcpstream)
     } else {
         Err(anyhow!("Peer did not send unchoke message!"))
@@ -305,8 +311,12 @@ fn main() -> anyhow::Result<()> {
         println!("{}:{}", ipv4ip, ipv4port);
     }
 
+    let client_ip = reqwest::blocking::get("http://ifconfig.me")?.text()?;
     let mut tcpstream: Option<std::net::TcpStream> = None;
     for p in peers_vec.iter() {
+        if p.split_once(':').unwrap().0 == client_ip {
+            continue;
+        }
         if let Some(t) = peer_initial_tcp_conn(p, &infohash_20_bytes, &peeridstr).ok() {
             tcpstream = Some(t);
             break;
@@ -360,10 +370,10 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>();
             tcpstream.write_all(&p)?;
             tcpstream.read_exact(&mut peer_payload)?;
-            assert_eq!(
-                peer_payload[4], 7,
-                "Message id should be 7 which is piece message!"
-            );
+            if peer_payload[4] != 7 {
+                println!("peer_payload[4] is {}, retrying...", peer_payload[4]);
+                continue;
+            }
             let mut block = vec![0u8; rem as usize];
             tcpstream.read_exact(&mut block)?;
             single_piece.extend_from_slice(&block);
