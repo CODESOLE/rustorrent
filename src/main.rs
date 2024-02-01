@@ -246,10 +246,6 @@ fn main() -> anyhow::Result<()> {
     println!("INFO_HASH: {infohash}");
     let piece_length = &decoded_val["info"]["piece length"];
     println!("PIECE_LENGTH: {piece_length}");
-    // println!("PIECE_HASHES:");
-    // for x in &pieces_hash {
-    //     println!("{x}");
-    // }
 
     let len_str = length.to_string();
     let a = hex::decode(&infohash).unwrap();
