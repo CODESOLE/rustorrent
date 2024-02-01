@@ -303,20 +303,21 @@ fn main() -> anyhow::Result<()> {
     let peers_bin = hex::decode(&peers)?;
     let mut peers_vec = Vec::<String>::new();
     println!("Peers IP:PORT:");
+    let client_ip = reqwest::blocking::get("http://ifconfig.me")?.text()?;
     for peer in peers_bin.chunks(6) {
         let ip = &peer[0..4];
         let ipv4ip = std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
         let ipv4port = u16::from_be_bytes([peer[4], peer[5]]);
-        peers_vec.push(format!("{}:{}", ipv4ip, ipv4port));
-        println!("{}:{}", ipv4ip, ipv4port);
-    }
-
-    let client_ip = reqwest::blocking::get("http://ifconfig.me")?.text()?;
-    let mut tcpstream: Option<std::net::TcpStream> = None;
-    for p in peers_vec.iter() {
+        let p = format!("{}:{}", ipv4ip, ipv4port);
         if p.split_once(':').unwrap().0 == client_ip {
             continue;
         }
+        peers_vec.push(p);
+        println!("{}:{}", ipv4ip, ipv4port);
+    }
+
+    let mut tcpstream: Option<std::net::TcpStream> = None;
+    for p in peers_vec.iter() {
         if let Some(t) = peer_initial_tcp_conn(p, &infohash_20_bytes, &peeridstr).ok() {
             tcpstream = Some(t);
             break;
@@ -335,7 +336,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut single_piece = Vec::<u8>::new();
     let mut peer_payload = [0u8; 13];
-    for p_idx in 0..pieces_hash.len() {
+    let pieces_hash_len = pieces_hash.len();
+    for p_idx in 0..pieces_hash_len {
         let p_len = if p_idx == pieces_hash.len() - 1 {
             let x = piece_length.as_u64().unwrap() as usize * (pieces_hash.len() - 1);
             length.to_string().parse::<usize>().unwrap() - x
@@ -380,7 +382,12 @@ fn main() -> anyhow::Result<()> {
             begin += block.len() as u32;
             block_idx += 1;
         }
-        println!("Downloaded piece_{} size: {}", p_idx, single_piece.len());
+        println!(
+            "Downloaded piece_{}/{} size: {}",
+            p_idx,
+            pieces_hash_len,
+            single_piece.len()
+        );
         let mut hasher_single_piece = Sha1::new();
         hasher_single_piece.update(&single_piece);
         let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
