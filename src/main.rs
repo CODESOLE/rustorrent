@@ -367,13 +367,13 @@ fn main() -> anyhow::Result<()> {
                 .cloned()
                 .collect::<Vec<_>>();
             tcpstream.write_all(&p)?;
-            tcpstream.read_exact(&mut peer_payload)?;
+            tcpstream.read_exact(&mut peer_payload).context("read_exact peer_payload")?;
             if peer_payload[4] != 7 {
                 println!("peer_payload[4] is {}, retrying...", peer_payload[4]);
                 continue;
             }
             let mut block = vec![0u8; rem as usize];
-            tcpstream.read_exact(&mut block)?;
+            tcpstream.read_exact(&mut block).context("read_exact block")?;
             single_piece.extend_from_slice(&block);
             begin += block.len() as u32;
             block_idx += 1;
