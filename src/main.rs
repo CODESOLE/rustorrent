@@ -334,8 +334,8 @@ fn main() -> anyhow::Result<()> {
     let mut peer_payload = [0u8; 13];
     let pieces_hash_len = pieces_hash.len();
     for p_idx in 0..pieces_hash_len {
-        let p_len = if p_idx == pieces_hash.len() - 1 {
-            let x = piece_length.as_u64().unwrap() as usize * (pieces_hash.len() - 1);
+        let p_len = if p_idx == pieces_hash_len - 1 {
+            let x = piece_length.as_u64().unwrap() as usize * (pieces_hash_len - 1);
             length.to_string().parse::<usize>().unwrap() - x
         } else {
             piece_length.as_u64().unwrap() as usize
