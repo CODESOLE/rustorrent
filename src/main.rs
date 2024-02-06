@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Ok};
 use hex::{FromHex, ToHex};
 use rand::{self, seq::SliceRandom, thread_rng};
-use threadpool::ThreadPool;
 use serde_json::{self, Map};
 use sha1::{Digest, Sha1};
 use std::{
@@ -9,8 +8,12 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{channel, Sender},
+        Arc, Mutex,
+    },
 };
+use threadpool::ThreadPool;
 
 fn decode_bencoded_value_u8(encoded_value: &[u8]) -> (Option<serde_json::Value>, &[u8]) {
     // If encoded_value starts with a digit, it's a number
@@ -336,8 +339,11 @@ fn main() -> anyhow::Result<()> {
             rem = pieces_hash.len() % 4;
         }
         if rem == 0 {
+            let mut downloaded_pieces_record = vec![false; pieces_hash.len()];
+            let (tx, rx) = channel();
             let tpool = ThreadPool::new(4);
             for i in 0..4usize {
+                let t = tx.clone();
                 let start = (i * n) as u32;
                 let end = start + n as u32;
                 let arc_file = Arc::clone(&dest_file);
@@ -348,6 +354,7 @@ fn main() -> anyhow::Result<()> {
                 let infohash_20_bytes_copy = infohash_20_bytes.clone();
                 tpool.execute(move || {
                     download_pieces(
+                        Some(t),
                         &decoded_val_copy,
                         &pieces_hash_copy,
                         start..end,
@@ -355,13 +362,19 @@ fn main() -> anyhow::Result<()> {
                         arc_file,
                         &infohash_20_bytes_copy,
                         &peeridstr_copy,
-                    ).expect("error download_pieces!");
+                    )
+                    .expect("error download_pieces!");
                 });
             }
+            rx.iter().for_each(|x| downloaded_pieces_record[x] = true);
             tpool.join();
+            todo!("serliaze/deseriliaze downloaded_pieces_record vector to a file!");
         } else {
+            let mut downloaded_pieces_record = vec![false; pieces_hash.len()];
+            let (tx, rx) = channel();
             let tpool = ThreadPool::new(5);
             for i in 0..5usize {
+                let t = tx.clone();
                 let start = (i * n) as u32;
                 let end = if i == 4 {
                     start + n as u32
@@ -376,6 +389,7 @@ fn main() -> anyhow::Result<()> {
                 let infohash_20_bytes_copy = infohash_20_bytes.clone();
                 tpool.execute(move || {
                     download_pieces(
+                        Some(t),
                         &decoded_val_copy,
                         &pieces_hash_copy,
                         start..end,
@@ -383,14 +397,18 @@ fn main() -> anyhow::Result<()> {
                         arc_file,
                         &infohash_20_bytes_copy,
                         &peeridstr_copy,
-                    ).expect("error download_pieces!");
+                    )
+                    .expect("error download_pieces!");
                 });
             }
+            rx.iter().for_each(|x| downloaded_pieces_record[x] = true);
             tpool.join();
+            todo!("serliaze/deseriliaze downloaded_pieces_record vector to a file!");
         }
     } else {
         println!("Single core!");
         download_pieces(
+            None,
             &decoded_val,
             &pieces_hash,
             0..pieces_hash.len() as u32,
@@ -405,6 +423,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn download_pieces(
+    t: Option<Sender<usize>>,
     decoded_val: &serde_json::Value,
     pieces_hash: &[String],
     piece_range: Range<u32>,
@@ -413,97 +432,217 @@ fn download_pieces(
     infohash_20_bytes: &[u8],
     peeridstr: &str,
 ) -> anyhow::Result<()> {
-    let mut tcpstream: Option<std::net::TcpStream> = None;
-    let mut peeripports = peeripports.to_vec();
-    peeripports.shuffle(&mut thread_rng());
-    for p in peeripports.iter() {
-        if let Some(t) = peer_initial_tcp_conn(p, infohash_20_bytes, peeridstr).ok() {
-            tcpstream = Some(t);
-            break;
-        }
-    }
-    if tcpstream.is_none() {
-        panic!("No peers send unchoke message!");
-    }
-    let mut tcpstream = tcpstream.unwrap();
-
-    let length = &decoded_val["info"]["length"];
-    let piece_length = &decoded_val["info"]["piece length"];
-
-    // send request(6) to each block
-    let mut single_piece = Vec::<u8>::new();
-    let mut peer_payload = [0u8; 13];
-    let pieces_hash_len = pieces_hash.len();
-    for p_idx in piece_range {
-        let p_len = if p_idx as usize == pieces_hash_len - 1 {
-            let x = piece_length.as_u64().unwrap() as usize * (pieces_hash_len - 1);
-            length.to_string().parse::<usize>().unwrap() - x
-        } else {
-            piece_length.as_u64().unwrap() as usize
-        };
-        single_piece.reserve_exact(p_len as usize);
-        let mut remainder_of_block: Option<u32> = None;
-        let block_count = if p_len % (16 * 1024) == 0 {
-            p_len as u32 / (16 * 1024) as u32
-        } else {
-            remainder_of_block = Some(p_len as u32 % (16 * 1024) as u32);
-            (p_len as u32 / (16 * 1024) + 1) as u32
-        };
-        let mut begin = 0u32;
-        let mut block_idx = 0u32;
-
-        while begin < p_len as u32 {
-            let rem = if block_idx == (block_count - 1) && remainder_of_block.is_some() {
-                remainder_of_block.clone().unwrap()
-            } else {
-                16 * 1024 as u32
-            };
-            let p = 13u32
-                .to_be_bytes()
-                .iter()
-                .chain([6].iter())
-                .chain(&(p_idx as u32).to_be_bytes())
-                .chain(&begin.to_be_bytes())
-                .chain(&rem.to_be_bytes())
-                .cloned()
-                .collect::<Vec<_>>();
-            tcpstream.write_all(&p)?;
-            tcpstream
-                .read_exact(&mut peer_payload)
-                .context("read_exact peer_payload")?;
-            if peer_payload[4] != 7 {
-                println!("peer_payload[4] is {}, retrying...", peer_payload[4]);
-                continue;
+    if t.is_none() {
+        // Single threaded mode
+        let mut downloaded_pieces_record = vec![false; pieces_hash.len()];
+        let mut tcpstream: Option<std::net::TcpStream> = None;
+        let mut peeripports = peeripports.to_vec();
+        peeripports.shuffle(&mut thread_rng());
+        for p in peeripports.iter() {
+            if let Some(t) = peer_initial_tcp_conn(p, infohash_20_bytes, peeridstr).ok() {
+                tcpstream = Some(t);
+                break;
             }
-            let mut block = vec![0u8; rem as usize];
-            tcpstream
-                .read_exact(&mut block)
-                .context("read_exact block")?;
-            single_piece.extend_from_slice(&block);
-            begin += block.len() as u32;
-            block_idx += 1;
         }
-        println!(
-            "Downloaded piece_{}/{} size: {}",
-            p_idx,
-            pieces_hash_len,
-            single_piece.len()
-        );
-        let mut hasher_single_piece = Sha1::new();
-        hasher_single_piece.update(&single_piece);
-        let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
-        let single_piece_hash_str = hex::encode(&single_piece_hash_bytes);
-        println!(
-            "{} <=> {}",
-            pieces_hash[p_idx as usize], &single_piece_hash_str
-        );
-        if pieces_hash[p_idx as usize] != single_piece_hash_str {
-            panic!("Piece {p_idx}'s hash is not same!");
+        if tcpstream.is_none() {
+            panic!("No peers send unchoke message!");
         }
-        let mut file_m = file.lock().unwrap();
-        file_m.seek(std::io::SeekFrom::Start((p_idx as usize * p_len) as u64))?;
-        file_m.write_all(&single_piece)?;
-        single_piece.clear();
+        let mut tcpstream = tcpstream.unwrap();
+
+        let length = &decoded_val["info"]["length"];
+        let piece_length = &decoded_val["info"]["piece length"];
+
+        // send request(6) to each block
+        let mut single_piece = Vec::<u8>::new();
+        let mut peer_payload = [0u8; 13];
+        let pieces_hash_len = pieces_hash.len();
+        for p_idx in piece_range {
+            let p_len = if p_idx as usize == pieces_hash_len - 1 {
+                let x = piece_length.as_u64().unwrap() as usize * (pieces_hash_len - 1);
+                length.to_string().parse::<usize>().unwrap() - x
+            } else {
+                piece_length.as_u64().unwrap() as usize
+            };
+            single_piece.reserve_exact(p_len as usize);
+            let mut remainder_of_block: Option<u32> = None;
+            let block_count = if p_len % (16 * 1024) == 0 {
+                p_len as u32 / (16 * 1024) as u32
+            } else {
+                remainder_of_block = Some(p_len as u32 % (16 * 1024) as u32);
+                (p_len as u32 / (16 * 1024) + 1) as u32
+            };
+            let mut begin = 0u32;
+            let mut block_idx = 0u32;
+
+            while begin < p_len as u32 {
+                let rem = if block_idx == (block_count - 1) && remainder_of_block.is_some() {
+                    remainder_of_block.clone().unwrap()
+                } else {
+                    16 * 1024 as u32
+                };
+                let p = 13u32
+                    .to_be_bytes()
+                    .iter()
+                    .chain([6].iter())
+                    .chain(&(p_idx as u32).to_be_bytes())
+                    .chain(&begin.to_be_bytes())
+                    .chain(&rem.to_be_bytes())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                tcpstream.write_all(&p)?;
+                tcpstream
+                    .read_exact(&mut peer_payload)
+                    .context("read_exact peer_payload")?;
+                if peer_payload[4] != 7 {
+                    println!("peer_payload[4] is {}, retrying...", peer_payload[4]);
+                    let cancel_req = 13u32
+                        .to_be_bytes()
+                        .iter()
+                        .chain([8].iter())
+                        .chain(&(p_idx as u32).to_be_bytes())
+                        .chain(&begin.to_be_bytes())
+                        .chain(&rem.to_be_bytes())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    tcpstream.write_all(&cancel_req)?;
+                    continue;
+                }
+                let mut block = vec![0u8; rem as usize];
+                tcpstream
+                    .read_exact(&mut block)
+                    .context("read_exact block")?;
+                single_piece.extend_from_slice(&block);
+                begin += block.len() as u32;
+                block_idx += 1;
+            }
+            println!(
+                "Downloaded piece_{}/{} size: {}",
+                p_idx,
+                pieces_hash_len,
+                single_piece.len()
+            );
+            let mut hasher_single_piece = Sha1::new();
+            hasher_single_piece.update(&single_piece);
+            let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
+            let single_piece_hash_str = hex::encode(&single_piece_hash_bytes);
+            if pieces_hash[p_idx as usize] != single_piece_hash_str {
+                println!("Piece {p_idx}'s hash is not same!");
+                panic!(
+                    "{} <=> {}",
+                    pieces_hash[p_idx as usize], &single_piece_hash_str
+                );
+            }
+            let mut file_m = file.lock().unwrap();
+            file_m.seek(std::io::SeekFrom::Start((p_idx as usize * p_len) as u64))?;
+            file_m.write_all(&single_piece)?;
+            downloaded_pieces_record[p_idx as usize] = true;
+            single_piece.clear();
+        }
+        todo!("serliaze/deseriliaze downloaded_pieces_record vector to a file!");
+    } else {
+        let mut tcpstream: Option<std::net::TcpStream> = None;
+        let mut peeripports = peeripports.to_vec();
+        peeripports.shuffle(&mut thread_rng());
+        for p in peeripports.iter() {
+            if let Some(t) = peer_initial_tcp_conn(p, infohash_20_bytes, peeridstr).ok() {
+                tcpstream = Some(t);
+                break;
+            }
+        }
+        if tcpstream.is_none() {
+            panic!("No peers send unchoke message!");
+        }
+        let mut tcpstream = tcpstream.unwrap();
+
+        let length = &decoded_val["info"]["length"];
+        let piece_length = &decoded_val["info"]["piece length"];
+
+        // send request(6) to each block
+        let mut single_piece = Vec::<u8>::new();
+        let mut peer_payload = [0u8; 13];
+        let pieces_hash_len = pieces_hash.len();
+        for p_idx in piece_range {
+            let p_len = if p_idx as usize == pieces_hash_len - 1 {
+                let x = piece_length.as_u64().unwrap() as usize * (pieces_hash_len - 1);
+                length.to_string().parse::<usize>().unwrap() - x
+            } else {
+                piece_length.as_u64().unwrap() as usize
+            };
+            single_piece.reserve_exact(p_len as usize);
+            let mut remainder_of_block: Option<u32> = None;
+            let block_count = if p_len % (16 * 1024) == 0 {
+                p_len as u32 / (16 * 1024) as u32
+            } else {
+                remainder_of_block = Some(p_len as u32 % (16 * 1024) as u32);
+                (p_len as u32 / (16 * 1024) + 1) as u32
+            };
+            let mut begin = 0u32;
+            let mut block_idx = 0u32;
+
+            while begin < p_len as u32 {
+                let rem = if block_idx == (block_count - 1) && remainder_of_block.is_some() {
+                    remainder_of_block.clone().unwrap()
+                } else {
+                    16 * 1024 as u32
+                };
+                let p = 13u32
+                    .to_be_bytes()
+                    .iter()
+                    .chain([6].iter())
+                    .chain(&(p_idx as u32).to_be_bytes())
+                    .chain(&begin.to_be_bytes())
+                    .chain(&rem.to_be_bytes())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                tcpstream.write_all(&p)?;
+                tcpstream
+                    .read_exact(&mut peer_payload)
+                    .context("read_exact peer_payload")?;
+                if peer_payload[4] != 7 {
+                    println!("peer_payload[4] is {}, retrying...", peer_payload[4]);
+                    let cancel_req = 13u32
+                        .to_be_bytes()
+                        .iter()
+                        .chain([8].iter())
+                        .chain(&(p_idx as u32).to_be_bytes())
+                        .chain(&begin.to_be_bytes())
+                        .chain(&rem.to_be_bytes())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    tcpstream.write_all(&cancel_req)?;
+                    continue;
+                }
+                let mut block = vec![0u8; rem as usize];
+                tcpstream
+                    .read_exact(&mut block)
+                    .context("read_exact block")?;
+                single_piece.extend_from_slice(&block);
+                begin += block.len() as u32;
+                block_idx += 1;
+            }
+            println!(
+                "Downloaded piece_{}/{} size: {}",
+                p_idx,
+                pieces_hash_len,
+                single_piece.len()
+            );
+            let mut hasher_single_piece = Sha1::new();
+            hasher_single_piece.update(&single_piece);
+            let single_piece_hash_bytes: &[u8] = &hasher_single_piece.finalize();
+            let single_piece_hash_str = hex::encode(&single_piece_hash_bytes);
+            if pieces_hash[p_idx as usize] != single_piece_hash_str {
+                println!("Piece {p_idx}'s hash is not same!");
+                panic!(
+                    "{} <=> {}",
+                    pieces_hash[p_idx as usize], &single_piece_hash_str
+                );
+            }
+            let mut file_m = file.lock().unwrap();
+            file_m.seek(std::io::SeekFrom::Start((p_idx as usize * p_len) as u64))?;
+            file_m.write_all(&single_piece)?;
+            t.as_ref().unwrap().send(p_idx as usize)?;
+            single_piece.clear();
+        }
     }
     Ok(())
 }
