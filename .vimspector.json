@@ -1,6 +1,6 @@
 {
   "configurations": {
-    "Launch with args: Cargo.toml": {
+    "Launch with args: sample.torrent": {
       "adapter": "CodeLLDB",
       "configuration": {
         "type": "rust",
