@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch with args: torrents/sample.torrent",
+            "type": "lldb",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "args": ["torrents/sample.torrent"],
+            "program": "${workspaceFolder}/target/debug/rustorrent.exe",
+            "preLaunchTask": "build"
+        },
+        {
+            "name": "Launch with args: torrents/0ad.torrent",
+            "type": "lldb",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "args": ["torrents/0ad.torrent"],
+            "program": "${workspaceFolder}/target/debug/rustorrent.exe",
+            "preLaunchTask": "build"
+        }
+    ]
+}
